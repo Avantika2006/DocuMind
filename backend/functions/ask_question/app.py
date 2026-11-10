@@ -137,6 +137,15 @@ def generate(question, top):
     return extractive(top)
 
 
+def answer_with_fallback(question, top):
+    """Call the LLM; if it fails (down, rate-limited), still return an answer."""
+    try:
+        return generate(question, top), LLM_PROVIDER
+    except Exception:
+        logger.exception('LLM call failed, falling back to extractive answer')
+        return extractive(top), 'extractive-fallback'
+
+
 # ---------- Handler ----------
 @logger.inject_lambda_context
 @tracer.capture_lambda_handler
@@ -160,20 +169,20 @@ def handler(event, context):
         return resp(409, {'error': 'Document is not ready yet'})
 
     items = load_chunks(doc_id)
-    use_vectors = bedrock is not None and all('embedding' in c for c in items)
+    use_vectors = bedrock is not None and items and all('embedding' in c for c in items)
     ranked = vector_rank(question, items) if use_vectors else bm25_rank(question, items)
     top = ranked[:TOP_K]
     retrieval = 'vector' if use_vectors else 'bm25'
 
-    if not top or top[0][0] <= 0:
-        answer, mode = 'I could not find anything about that in the document.', 'no-match'
+    if top and top[0][0] > 0:
+        # Normal case: keywords matched
+        answer, mode = answer_with_fallback(question, top)
+    elif LLM_PROVIDER != 'none' and items:
+        # Generic question (e.g. "summarize"): give the LLM the start of the doc
+        top = [(0.0, c) for c in items[:TOP_K]]
+        answer, mode = answer_with_fallback(question, top)
     else:
-        try:
-            answer, mode = generate(question, top), LLM_PROVIDER
-        except Exception:
-            # Graceful degradation: LLM down or rate-limited -> still answer
-            logger.exception('LLM call failed, falling back to extractive answer')
-            answer, mode = extractive(top), 'extractive-fallback'
+        answer, mode = 'I could not find anything about that in the document.', 'no-match'
 
     latency_ms = int((time.time() - started) * 1000)
     metrics.add_metric(name='QuestionsAnswered', unit=MetricUnit.Count, value=1)
