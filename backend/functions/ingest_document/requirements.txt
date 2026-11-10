@@ -1,0 +1,2 @@
+pypdf
+aws-lambda-powertools[tracer]

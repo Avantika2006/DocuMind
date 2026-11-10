@@ -1,0 +1,210 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: DocuMind - serverless document Q&A
+
+Parameters:
+  LlmProvider:
+    Type: String
+    Default: none
+    AllowedValues: [none, gemini, bedrock]
+  LlmModelId:
+    Type: String
+    Default: gemini-2.5-flash   # for bedrock use us.amazon.nova-lite-v1:0
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    Handler: app.handler
+    Timeout: 30
+    MemorySize: 512
+    Tracing: Active
+    Environment:
+      Variables:
+        DOCS_TABLE: !Ref DocsTable
+        CHUNKS_TABLE: !Ref ChunksTable
+        POWERTOOLS_SERVICE_NAME: documind
+        POWERTOOLS_METRICS_NAMESPACE: DocuMind
+
+Resources:
+  DocsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-docs-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-uploads
+            Status: Enabled
+            ExpirationInDays: 30
+
+  DocsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: docId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: docId
+          KeyType: HASH
+
+  ChunksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: docId
+          AttributeType: S
+        - AttributeName: chunkId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: docId
+          KeyType: HASH
+        - AttributeName: chunkId
+          KeyType: RANGE
+
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [content-type]
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  UploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/functions/upload_url/
+      Environment:
+        Variables:
+          BUCKET: !Ref DocsBucket
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref DocsBucket
+        - DynamoDBWritePolicy:
+            TableName: !Ref DocsTable
+      Events:
+        GetUploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /upload-url
+            Method: GET
+
+  ListDocumentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/functions/list_documents/
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DocsTable
+      Events:
+        ListDocs:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /docs
+            Method: GET
+
+  IngestDocumentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/functions/ingest_document/
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          EMBED_PROVIDER: none
+          EMBED_MODEL_ID: amazon.titan-embed-text-v2:0
+      Policies:
+        - S3ReadPolicy:
+            # built from the name, not !Ref DocsBucket, to avoid a circular dependency
+            BucketName: !Sub ${AWS::StackName}-docs-${AWS::AccountId}
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DocsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref ChunksTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt IngestDLQ.QueueName
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt IngestDLQ.Arn
+      Events:
+        PdfUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref DocsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: docs/
+                  - Name: suffix
+                    Value: .pdf
+
+  AskQuestionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/functions/ask_question/
+      Environment:
+        Variables:
+          LLM_PROVIDER: !Ref LlmProvider
+          LLM_MODEL_ID: !Ref LlmModelId
+          EMBED_MODEL_ID: amazon.titan-embed-text-v2:0
+          GEMINI_KEY_PARAM: /documind/gemini-api-key
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DocsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref ChunksTable
+        - SSMParameterReadPolicy:
+            ParameterName: documind/gemini-api-key
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-lite-v1:0
+                - arn:aws:bedrock:*::foundation-model/amazon.nova-lite-v1:0
+      Events:
+        Ask:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /ask
+            Method: POST
+
+  IngestDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600   # 14 days
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+  BucketName:
+    Value: !Ref DocsBucket
